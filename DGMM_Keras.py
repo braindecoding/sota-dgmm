@@ -41,6 +41,13 @@ from cal import S as calculateS
 import pickle
 import os
 
+# 📊 IMPORT EVALUATION METRICS
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from scipy.stats import pearsonr
+import cv2
+import pandas as pd
+
 # Configuration for model saving/loading
 MODEL_SAVE_PATH = 'dgmm_model_checkpoint.pkl'
 KERAS_MODEL_PATH = 'dgmm_keras_model.keras'
@@ -508,10 +515,116 @@ for i in range(numTest):
 
     X_reconstructed_mu[i,:,:,:] = x_reconstructed_transposed
 
+# 📊 EVALUATION METRICS CALCULATION
+print("\n🔍 Computing reconstruction quality metrics...")
+
+def calculate_metrics(original, reconstructed):
+    """Calculate comprehensive reconstruction metrics"""
+    metrics_results = {}
+
+    # Ensure both images are in the same format (0-1 range)
+    if original.max() > 1.0:
+        original = original.astype(np.float32) / 255.0
+    if reconstructed.max() > 1.0:
+        reconstructed = reconstructed.astype(np.float32) / 255.0
+
+    # Flatten for some metrics
+    orig_flat = original.flatten()
+    recon_flat = reconstructed.flatten()
+
+    # 1. MSE (Mean Squared Error)
+    mse = np.mean((orig_flat - recon_flat) ** 2)
+    metrics_results['MSE'] = mse
+
+    # 2. SSIM (Structural Similarity Index)
+    # Convert to grayscale if needed
+    if len(original.shape) == 3 and original.shape[2] == 1:
+        orig_2d = original[:,:,0]
+        recon_2d = reconstructed[:,:,0]
+    else:
+        orig_2d = original
+        recon_2d = reconstructed
+
+    ssim_value = ssim(orig_2d, recon_2d, data_range=1.0)
+    metrics_results['SSIM'] = ssim_value
+
+    # 3. Pixel Correlation (Pearson correlation)
+    correlation, _ = pearsonr(orig_flat, recon_flat)
+    metrics_results['PixelCorr'] = correlation
+
+    # 4. PSNR (Peak Signal-to-Noise Ratio)
+    psnr_value = psnr(orig_2d, recon_2d, data_range=1.0)
+    metrics_results['PSNR'] = psnr_value
+
+    # 5. FID (Fréchet Inception Distance) - Simplified version
+    # For now, we'll use a simplified metric based on feature statistics
+    # In a full implementation, this would use pre-trained Inception features
+    orig_mean = np.mean(orig_flat)
+    orig_std = np.std(orig_flat)
+    recon_mean = np.mean(recon_flat)
+    recon_std = np.std(recon_flat)
+
+    # Simplified FID-like metric (not true FID, but captures distribution differences)
+    fid_like = (orig_mean - recon_mean)**2 + (orig_std - recon_std)**2
+    metrics_results['FID_like'] = fid_like
+
+    # 6. CLIP Similarity - Placeholder
+    # For now, we'll use cosine similarity of flattened images
+    # In a full implementation, this would use CLIP embeddings
+    dot_product = np.dot(orig_flat, recon_flat)
+    norm_orig = np.linalg.norm(orig_flat)
+    norm_recon = np.linalg.norm(recon_flat)
+    cosine_sim = dot_product / (norm_orig * norm_recon)
+    metrics_results['CLIP_like'] = cosine_sim
+
+    return metrics_results
+
+# Calculate metrics for all test samples
+all_metrics = []
+print(f"📊 Evaluating {numTest} reconstructed samples...")
+
+for i in range(numTest):
+    # Get original and reconstructed images
+    original = X_test[i]  # Shape: (28, 28, 1)
+    reconstructed = X_reconstructed_mu[i].transpose(1, 2, 0)  # Convert from (1, 28, 28) to (28, 28, 1)
+
+    # Calculate metrics for this sample
+    sample_metrics = calculate_metrics(original, reconstructed)
+    sample_metrics['Sample'] = i + 1
+    all_metrics.append(sample_metrics)
+
+    print(f"Sample {i+1}: MSE={sample_metrics['MSE']:.6f}, SSIM={sample_metrics['SSIM']:.4f}, "
+          f"PixelCorr={sample_metrics['PixelCorr']:.4f}, PSNR={sample_metrics['PSNR']:.2f}, "
+          f"FID_like={sample_metrics['FID_like']:.6f}, CLIP_like={sample_metrics['CLIP_like']:.4f}")
+
+# Calculate average metrics
+avg_metrics = {}
+for metric in ['MSE', 'SSIM', 'PixelCorr', 'PSNR', 'FID_like', 'CLIP_like']:
+    avg_metrics[metric] = np.mean([m[metric] for m in all_metrics])
+
+print(f"\n📈 AVERAGE RECONSTRUCTION METRICS:")
+print(f"   MSE: {avg_metrics['MSE']:.6f}")
+print(f"   SSIM: {avg_metrics['SSIM']:.4f}")
+print(f"   Pixel Correlation: {avg_metrics['PixelCorr']:.4f}")
+print(f"   PSNR: {avg_metrics['PSNR']:.2f} dB")
+print(f"   FID-like: {avg_metrics['FID_like']:.6f}")
+print(f"   CLIP-like: {avg_metrics['CLIP_like']:.4f}")
+
+# Save metrics to file
+import pandas as pd
+metrics_df = pd.DataFrame(all_metrics)
+metrics_df.to_csv('dgmm_reconstruction_metrics.csv', index=False)
+print(f"✅ Detailed metrics saved to: dgmm_reconstruction_metrics.csv")
+
+# Save average metrics
+avg_df = pd.DataFrame([avg_metrics])
+avg_df.to_csv('dgmm_average_metrics.csv', index=False)
+print(f"✅ Average metrics saved to: dgmm_average_metrics.csv")
+
 # visualization the reconstructed images
 n = 10
 for j in range(1):
-    plt.figure(figsize=(12, 2))    
+    plt.figure(figsize=(12, 2))
     for i in range(n):
         # display original images
         ax = plt.subplot(2, n, i +j*n*2 + 1)
