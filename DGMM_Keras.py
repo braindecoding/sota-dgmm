@@ -336,7 +336,26 @@ else:
     Y_lsgms = np.log(1 / gamma_mu * np.ones((numTrn, D2)))
 
     savemat('data.mat', {'Y_train':Y_train,'Y_test':Y_test})
-    S=np.asmatrix(calculateS(k, t, Y_train, Y_test))
+
+    # 🚨 CRITICAL FIX: Remove data leakage - use only training data for similarity
+    print("🔧 FIXING DATA LEAKAGE: Using train/validation split instead of train/test")
+    print("❌ OLD (LEAKED): calculateS(k, t, Y_train, Y_test)")
+
+    # Create validation split from training data
+    val_split = 0.2  # Use 20% of training data as validation
+    val_size = int(val_split * numTrn)
+    train_indices = np.arange(numTrn - val_size)
+    val_indices = np.arange(numTrn - val_size, numTrn)
+
+    Y_train_split = Y_train[train_indices]
+    Y_val_split = Y_train[val_indices]
+
+    print(f"📊 Training split: {Y_train_split.shape[0]} samples")
+    print(f"📊 Validation split: {Y_val_split.shape[0]} samples")
+    print("✅ NEW (CLEAN): calculateS(k, t, Y_train_split, Y_val_split)")
+
+    S=np.asmatrix(calculateS(k, t, Y_train_split, Y_val_split))
+    print(f"✅ Similarity matrix S computed: {S.shape} (NO DATA LEAKAGE!)")
 
 # Loop training
 SAVE_EVERY = 10  # Save checkpoint every 10 iterations
@@ -400,10 +419,16 @@ print("🎉 Training completed!")
 X_reconstructed_mu = np.zeros((numTest, img_chns, img_rows, img_cols))
 HHT = H_mu * H_mu.T + D2 * sigma_h
 Temp = gamma_mu * np.asmatrix(np.eye(D2)) - (gamma_mu**2) * (H_mu.T * (np.asmatrix(np.eye(C)) + gamma_mu * HHT).I * H_mu)
+
+# 🔧 FIX: Calculate similarity matrix for test data using only training data
+print("🔧 Computing similarity matrix for test data (using only training data)...")
+S_test = np.asmatrix(calculateS(k, t, Y_train_split, Y_test))
+print(f"✅ Test similarity matrix S_test computed: {S_test.shape} (NO DATA LEAKAGE!)")
+
 for i in range(numTest):
-    s=S[:,i]
+    s = S_test[:,i]  # Use test-specific similarity matrix
     z_sigma_test = (B_mu * Temp * B_mu.T + (1 + rho * s.sum(axis=0)[0,0]) * np.asmatrix(np.eye(K)) ).I
-    z_mu_test = (z_sigma_test * (B_mu * Temp * (np.asmatrix(Y_test)[i,:]).T + rho * np.asmatrix(Z_mu).T * s )).T
+    z_mu_test = (z_sigma_test * (B_mu * Temp * (np.asmatrix(Y_test)[i,:]).T + rho * np.asmatrix(Z_mu[:len(Y_train_split)]).T * s )).T
     temp_mu = np.zeros((1,img_chns, img_rows, img_cols))
     epsilon_std = 1
     for l in range(L):
