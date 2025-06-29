@@ -1,4 +1,8 @@
 # Code for paper “Reconstructing Perceived Images from Human Brain Activities with Bayesian Deep Multi-view Learning”
+
+rm -f dgmm_model_checkpoint.pkl dgmm_keras_model.keras
+python3 DGMM_Keras.py
+
 > - Authors: Changde Du, Changying Du, Lijie Huang, Huiguang He
 
 This repository contains the implementation of the Deep Generative Multi-view Model (DGMM) described in

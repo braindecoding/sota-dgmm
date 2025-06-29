@@ -28,8 +28,13 @@ from sklearn import preprocessing
 from keras.layers import Input, Dense, Lambda, Flatten, Reshape
 from keras.layers import Conv2D, Conv2DTranspose
 from keras.models import Model
+
+# 🎯 SET RANDOM SEEDS FOR REPRODUCIBILITY
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+print(f"🎯 Random seeds set to {RANDOM_SEED} for reproducible results")
 from keras import backend
-from numpy import random
 from keras import optimizers
 
 from cal import S as calculateS
@@ -105,7 +110,7 @@ k=10     # k-nearest neighbors
 t = 10.0 # kernel parameter in similarity measure
 L = 100   # Monte-Carlo sampling
 
-np.random.seed(1000)
+# Random seed already set globally at the top of file
 numTrn=X_train.shape[0]
 numTest=X_test.shape[0]
 
@@ -349,13 +354,13 @@ if checkpoint is not None:
     print(f"✅ Resuming from iteration {start_iteration}")
 
 else:
-    # Fresh initialization
+    # Fresh initialization with consistent random seed
     print("🆕 Starting fresh training...")
-    Z_mu = np.asmatrix(random.random(size=(numTrn,K)))
-    B_mu = np.asmatrix(random.random(size=(K,D2)))
-    R_mu = np.asmatrix(random.random(size=(numTrn,C)))
+    Z_mu = np.asmatrix(np.random.random(size=(numTrn,K)))
+    B_mu = np.asmatrix(np.random.random(size=(K,D2)))
+    R_mu = np.asmatrix(np.random.random(size=(numTrn,C)))
     sigma_r = np.asmatrix(np.eye((C)))
-    H_mu = np.asmatrix(random.random(size=(C,D2)))
+    H_mu = np.asmatrix(np.random.random(size=(C,D2)))
     sigma_h = np.asmatrix(np.eye((C)))
 
     tau_mu = tau_alpha / tau_beta
