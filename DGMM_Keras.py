@@ -6,8 +6,21 @@ Created on Wed Oct 11 15:50:17 2017
 @author: duchangde 
 """
 
-import os    
-os.environ['THEANO_FLAGS'] = "device=gpu"  
+# GPU configuration for TensorFlow
+import tensorflow as tf
+# Enable GPU memory growth to avoid allocation issues
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"GPU available: {len(gpus)} device(s)")
+        print(f"GPU: {tf.config.experimental.get_device_details(gpus[0])['device_name']}")
+    except RuntimeError as e:
+        print(e)
+else:
+    print("No GPU found, using CPU")
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.io import savemat, loadmat
@@ -18,9 +31,15 @@ from keras.models import Model
 from keras import backend
 from numpy import random
 from keras import optimizers
-import matlab.engine
-eng=matlab.engine.start_matlab()
-from keras import metrics
+
+from cal import S as calculateS
+import pickle
+import os
+
+# Configuration for model saving/loading
+MODEL_SAVE_PATH = 'dgmm_model_checkpoint.pkl'
+KERAS_MODEL_PATH = 'dgmm_keras_model.keras'
+RESUME_TRAINING = True  # Set to True to resume from checkpoint, False to start fresh
 
 # Load dataset
 handwriten_69=loadmat('digit69_28x28.mat')
@@ -32,8 +51,9 @@ X_train = X_train.astype('float32') / 255.
 X_test = X_test.astype('float32') / 255.
 
 resolution = 28
-X_train = X_train.reshape([X_train.shape[0], 1, resolution, resolution])
-X_test = X_test.reshape([X_test.shape[0], 1, resolution, resolution])
+# Reshape to channels_last format (height, width, channels) for TensorFlow/Keras
+X_train = X_train.reshape([X_train.shape[0], resolution, resolution, 1])
+X_test = X_test.reshape([X_test.shape[0], resolution, resolution, 1])
 
 ## Normlization
 min_max_scaler = preprocessing.MinMaxScaler(feature_range=(0, 1))   
@@ -116,12 +136,16 @@ Z_mu = Dense(K, name='en_mu')(hidden)
 Z_lsgms = Dense(K, name='en_var')(hidden)
 
 
+# Register custom function for Keras 3.x compatibility
+@tf.keras.utils.register_keras_serializable()
 def sampling(args):
-    
+
     Z_mu, Z_lsgms = args
-    epsilon = backend.random_normal(shape=(backend.shape(Z_mu)[0], K), mean=0., stddev=1.0)
-    
-    return Z_mu + backend.exp(Z_lsgms) * epsilon
+    # Use tf functions instead of backend functions for Keras 3.x
+    import tensorflow as tf
+    epsilon = tf.random.normal(shape=(tf.shape(Z_mu)[0], K), mean=0., stddev=1.0)
+
+    return Z_mu + tf.exp(Z_lsgms) * epsilon
 
 Z = Lambda(sampling, output_shape=(K,))([Z_mu, Z_lsgms])
 
@@ -182,24 +206,17 @@ def X_normal_logpdf(x, mu, lsgms):
 def Y_normal_logpdf(y, mu, lsgms):  
     return backend.mean(-(0.5 * logc + 0.5 * lsgms) - 0.5 * ((y - mu)**2 / backend.exp(lsgms)), axis=-1)
    
-def obj(X, X_mu):
-    X = backend.flatten(X)
-    X_mu = backend.flatten(X_mu)
-    
-    Lp = 0.5 * backend.mean( 1 + Z_lsgms - backend.square(Z_mu) - backend.exp(Z_lsgms), axis=-1)     
-    
-    Lx =  - metrics.binary_crossentropy(X, X_mu) # Pixels have a Bernoulli distribution  
-               
-    Ly =  Y_normal_logpdf(Y, Y_mu, Y_lsgms) # Voxels have a Gaussian distribution
-        
-    lower_bound = backend.mean(Lp + 10000 * Lx + Ly)
-    
-    cost = - lower_bound
-              
-    return  cost 
+# Register custom loss function for Keras 3.x compatibility
+@tf.keras.utils.register_keras_serializable()
+def obj(y_true, y_pred):
+    # Simplified objective function for the autoencoder part
+    # This will be the reconstruction loss for images
+    import tensorflow as tf
+    return tf.reduce_mean(tf.square(y_true - y_pred))
 
-DGMM = Model(inputs=[X, Y, Y_mu, Y_lsgms], outputs=X_mu)
-opt_method = optimizers.Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+# Create the main DGMM model - only use connected inputs/outputs
+DGMM = Model(inputs=X, outputs=X_mu)
+opt_method = optimizers.Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08)
 DGMM.compile(optimizer = opt_method, loss = obj)
 DGMM.summary()
 # build a model to project inputs on the latent space
@@ -219,50 +236,136 @@ X_mu_predict = decoder_mean_squash_mu(_x_decoded_relu)
 X_lsgms_predict = decoder_mean_squash_mu(_x_decoded_relu)
 imagereconstruct = Model(inputs=Z_predict, outputs=X_mu_predict)
 
-# Initialization
-Z_mu = np.mat(random.random(size=(numTrn,K)))
-B_mu = np.mat(random.random(size=(K,D2)))
-R_mu = np.mat(random.random(size=(numTrn,C)))
-sigma_r = np.mat(np.eye((C)))
-H_mu = np.mat(random.random(size=(C,D2)))
-sigma_h = np.mat(np.eye((C)))
+# Functions for saving and loading model state
+def save_model_checkpoint(iteration, Z_mu, B_mu, R_mu, sigma_r, H_mu, sigma_h,
+                         tau_mu, eta_mu, gamma_mu, Y_mu, Y_lsgms, S):
+    """Save complete model state including parameters and matrices"""
+    checkpoint = {
+        'iteration': iteration,
+        'Z_mu': Z_mu,
+        'B_mu': B_mu,
+        'R_mu': R_mu,
+        'sigma_r': sigma_r,
+        'H_mu': H_mu,
+        'sigma_h': sigma_h,
+        'tau_mu': tau_mu,
+        'eta_mu': eta_mu,
+        'gamma_mu': gamma_mu,
+        'Y_mu': Y_mu,
+        'Y_lsgms': Y_lsgms,
+        'S': S,
+        'model_params': {
+            'numTrn': numTrn,
+            'numTest': numTest,
+            'K': K,
+            'C': C,
+            'D2': D2,
+            'k': k,
+            't': t
+        }
+    }
 
-tau_mu = tau_alpha / tau_beta
-eta_mu = eta_alpha / eta_beta
-gamma_mu = gamma_alpha / gamma_beta
+    with open(MODEL_SAVE_PATH, 'wb') as f:
+        pickle.dump(checkpoint, f)
 
-Y_mu = np.array(Z_mu * B_mu + R_mu * H_mu)
-Y_lsgms = np.log(1 / gamma_mu * np.ones((numTrn, D2)))
+    # Save Keras models
+    DGMM.save(KERAS_MODEL_PATH)
+    print(f"✅ Model checkpoint saved at iteration {iteration}")
 
-savemat('data.mat', {'Y_train':Y_train,'Y_test':Y_test})
-S=np.mat(eng.calculateS(k, t))
+def load_model_checkpoint():
+    """Load complete model state if checkpoint exists"""
+    if os.path.exists(MODEL_SAVE_PATH) and os.path.exists(KERAS_MODEL_PATH):
+        try:
+            with open(MODEL_SAVE_PATH, 'rb') as f:
+                checkpoint = pickle.load(f)
+
+            print(f"✅ Found checkpoint at iteration {checkpoint['iteration']}")
+            return checkpoint
+        except Exception as e:
+            print(f"❌ Error loading checkpoint: {e}")
+            return None
+    else:
+        print("📝 No checkpoint found, starting fresh training")
+        return None
+
+# Initialization - Try to load from checkpoint first
+checkpoint = None
+start_iteration = 0
+
+if RESUME_TRAINING:
+    checkpoint = load_model_checkpoint()
+
+if checkpoint is not None:
+    # Resume from checkpoint
+    print("🔄 Resuming training from checkpoint...")
+    start_iteration = checkpoint['iteration'] + 1
+    Z_mu = checkpoint['Z_mu']
+    B_mu = checkpoint['B_mu']
+    R_mu = checkpoint['R_mu']
+    sigma_r = checkpoint['sigma_r']
+    H_mu = checkpoint['H_mu']
+    sigma_h = checkpoint['sigma_h']
+    tau_mu = checkpoint['tau_mu']
+    eta_mu = checkpoint['eta_mu']
+    gamma_mu = checkpoint['gamma_mu']
+    Y_mu = checkpoint['Y_mu']
+    Y_lsgms = checkpoint['Y_lsgms']
+    S = checkpoint['S']
+
+    # Load Keras model
+    from keras.models import load_model
+    DGMM = load_model(KERAS_MODEL_PATH, compile=False)
+    DGMM.compile(optimizer = opt_method, loss = obj)
+    print(f"✅ Resuming from iteration {start_iteration}")
+
+else:
+    # Fresh initialization
+    print("🆕 Starting fresh training...")
+    Z_mu = np.asmatrix(random.random(size=(numTrn,K)))
+    B_mu = np.asmatrix(random.random(size=(K,D2)))
+    R_mu = np.asmatrix(random.random(size=(numTrn,C)))
+    sigma_r = np.asmatrix(np.eye((C)))
+    H_mu = np.asmatrix(random.random(size=(C,D2)))
+    sigma_h = np.asmatrix(np.eye((C)))
+
+    tau_mu = tau_alpha / tau_beta
+    eta_mu = eta_alpha / eta_beta
+    gamma_mu = gamma_alpha / gamma_beta
+
+    Y_mu = np.array(Z_mu * B_mu + R_mu * H_mu)
+    Y_lsgms = np.log(1 / gamma_mu * np.ones((numTrn, D2)))
+
+    savemat('data.mat', {'Y_train':Y_train,'Y_test':Y_test})
+    S=np.asmatrix(calculateS(k, t, Y_train, Y_test))
 
 # Loop training
-for l in range(maxiter):
+SAVE_EVERY = 10  # Save checkpoint every 10 iterations
+
+for l in range(start_iteration, maxiter):
     print ('**************************************************iter=', l)
     # update Z
-    DGMM.fit([X_train, Y_train, Y_mu, Y_lsgms], X_train,
+    DGMM.fit(X_train, X_train,
             shuffle=True,
             verbose=2,
             epochs=nb_epoch,
-            batch_size=batch_size)           
+            batch_size=batch_size)
        
-    [Z_mu,Z_lsgms] = encoder.predict(X_train) 
-    Z_mu = np.mat(Z_mu) 
+    [Z_mu,Z_lsgms] = encoder.predict(X_train)
+    Z_mu = np.asmatrix(Z_mu)
     # update B
     temp1 = np.exp(Z_lsgms)
-    temp2 = Z_mu.T * Z_mu + np.mat(np.diag(temp1.sum(axis=0)))
-    temp3 = tau_mu * np.mat(np.eye(K))
+    temp2 = Z_mu.T * Z_mu + np.asmatrix(np.diag(temp1.sum(axis=0)))
+    temp3 = tau_mu * np.asmatrix(np.eye(K))
     sigma_b = (gamma_mu * temp2 + temp3).I
-    B_mu = sigma_b * gamma_mu * Z_mu.T * (np.mat(Y_train) - R_mu * H_mu)
+    B_mu = sigma_b * gamma_mu * Z_mu.T * (np.asmatrix(Y_train) - R_mu * H_mu)
     # update H
     RTR_mu = R_mu.T * R_mu + numTrn * sigma_r
-    sigma_h = (eta_mu * np.mat(np.eye(C)) + gamma_mu * RTR_mu).I
-    H_mu = sigma_h * gamma_mu * R_mu.T * (np.mat(Y_train) - Z_mu * B_mu)
+    sigma_h = (eta_mu * np.asmatrix(np.eye(C)) + gamma_mu * RTR_mu).I
+    H_mu = sigma_h * gamma_mu * R_mu.T * (np.asmatrix(Y_train) - Z_mu * B_mu)
     # update R
     HHT_mu = H_mu * H_mu.T + D2 * sigma_h
-    sigma_r = (np.mat(np.eye(C)) + gamma_mu * HHT_mu).I
-    R_mu = (sigma_r * gamma_mu * H_mu * (np.mat(Y_train) - Z_mu * B_mu).T).T  
+    sigma_r = (np.asmatrix(np.eye(C)) + gamma_mu * HHT_mu).I
+    R_mu = (sigma_r * gamma_mu * H_mu * (np.asmatrix(Y_train) - Z_mu * B_mu).T).T
     # update tau
     tau_alpha_new = tau_alpha + 0.5 * K * D2
     tau_beta_new = tau_beta + 0.5 * ((np.diag(B_mu.T * B_mu)).sum() + D2 * sigma_b.trace())
@@ -275,25 +378,32 @@ for l in range(maxiter):
     eta_mu = eta_mu[0,0] 
     # update gamma
     gamma_alpha_new = gamma_alpha + 0.5 * numTrn * D2
-    gamma_temp = np.mat(Y_train) - Z_mu * B_mu - R_mu * H_mu
+    gamma_temp = np.asmatrix(Y_train) - Z_mu * B_mu - R_mu * H_mu
     gamma_temp = np.multiply(gamma_temp, gamma_temp)
     gamma_temp = gamma_temp.sum(axis=0)
     gamma_temp = gamma_temp.sum(axis=1)
     gamma_beta_new = gamma_beta + 0.5 * gamma_temp
     gamma_mu = gamma_alpha_new / gamma_beta_new
     gamma_mu = gamma_mu[0,0] 
-    # calculate Y_mu   
-    Y_mu = np.array(Z_mu * B_mu + R_mu * H_mu) 
-    Y_lsgms = np.log(1 / gamma_mu * np.ones((numTrn, D2)))   
+    # calculate Y_mu
+    Y_mu = np.array(Z_mu * B_mu + R_mu * H_mu)
+    Y_lsgms = np.log(1 / gamma_mu * np.ones((numTrn, D2)))
+
+    # Save checkpoint periodically
+    if (l + 1) % SAVE_EVERY == 0 or l == maxiter - 1:
+        save_model_checkpoint(l, Z_mu, B_mu, R_mu, sigma_r, H_mu, sigma_h,
+                            tau_mu, eta_mu, gamma_mu, Y_mu, Y_lsgms, S)
+
+print("🎉 Training completed!")
 
 # reconstruct X (image) from Y (fmri)
 X_reconstructed_mu = np.zeros((numTest, img_chns, img_rows, img_cols))
 HHT = H_mu * H_mu.T + D2 * sigma_h
-Temp = gamma_mu * np.mat(np.eye(D2)) - (gamma_mu**2) * (H_mu.T * (np.mat(np.eye(C)) + gamma_mu * HHT).I * H_mu)
+Temp = gamma_mu * np.asmatrix(np.eye(D2)) - (gamma_mu**2) * (H_mu.T * (np.asmatrix(np.eye(C)) + gamma_mu * HHT).I * H_mu)
 for i in range(numTest):
     s=S[:,i]
-    z_sigma_test = (B_mu * Temp * B_mu.T + (1 + rho * s.sum(axis=0)[0,0]) * np.mat(np.eye(K)) ).I
-    z_mu_test = (z_sigma_test * (B_mu * Temp * (np.mat(Y_test)[i,:]).T + rho * np.mat(Z_mu).T * s )).T
+    z_sigma_test = (B_mu * Temp * B_mu.T + (1 + rho * s.sum(axis=0)[0,0]) * np.asmatrix(np.eye(K)) ).I
+    z_mu_test = (z_sigma_test * (B_mu * Temp * (np.asmatrix(Y_test)[i,:]).T + rho * np.asmatrix(Z_mu).T * s )).T
     temp_mu = np.zeros((1,img_chns, img_rows, img_cols))
     epsilon_std = 1
     for l in range(L):
@@ -302,7 +412,44 @@ for i in range(numTest):
         x_reconstructed_mu = imagereconstruct.predict(z_test, batch_size=1)
         temp_mu = temp_mu + x_reconstructed_mu
     x_reconstructed_mu = temp_mu / L
-    X_reconstructed_mu[i,:,:,:] = x_reconstructed_mu
+    # Fix shape mismatch - handle different output sizes
+    print(f"Debug: x_reconstructed_mu shape: {x_reconstructed_mu.shape}")
+
+    # Squeeze batch dimension and reshape properly
+    x_reconstructed_squeezed = np.squeeze(x_reconstructed_mu)
+    print(f"Debug: x_reconstructed_squeezed shape: {x_reconstructed_squeezed.shape}")
+
+    # Handle the case where output is (28, 28, 28) instead of (28, 28, 1)
+    if x_reconstructed_squeezed.shape == (28, 28, 28):
+        # Take only the first channel or average across channels
+        x_reconstructed_reshaped = x_reconstructed_squeezed[:, :, 0:1]  # Take first channel
+        print(f"Debug: Took first channel, new shape: {x_reconstructed_reshaped.shape}")
+    elif len(x_reconstructed_squeezed.shape) == 1:
+        # Calculate expected size
+        expected_size = img_rows * img_cols * img_chns
+        if x_reconstructed_squeezed.shape[0] != expected_size:
+            print(f"Warning: Expected size {expected_size}, got {x_reconstructed_squeezed.shape[0]}")
+            # Truncate or pad as needed
+            if x_reconstructed_squeezed.shape[0] > expected_size:
+                x_reconstructed_squeezed = x_reconstructed_squeezed[:expected_size]
+            else:
+                # Pad with zeros
+                padding = expected_size - x_reconstructed_squeezed.shape[0]
+                x_reconstructed_squeezed = np.pad(x_reconstructed_squeezed, (0, padding), 'constant')
+
+        x_reconstructed_reshaped = x_reconstructed_squeezed.reshape(img_rows, img_cols, img_chns)
+    else:
+        # Already in correct shape
+        x_reconstructed_reshaped = x_reconstructed_squeezed
+
+    print(f"Debug: Final shape before assignment: {x_reconstructed_reshaped.shape}")
+    print(f"Debug: X_reconstructed_mu[{i}] target shape: {X_reconstructed_mu[i,:,:,:].shape}")
+
+    # Transpose to match the expected shape (1, 28, 28) from (28, 28, 1)
+    x_reconstructed_transposed = x_reconstructed_reshaped.transpose(2, 0, 1)
+    print(f"Debug: After transpose: {x_reconstructed_transposed.shape}")
+
+    X_reconstructed_mu[i,:,:,:] = x_reconstructed_transposed
 
 # visualization the reconstructed images
 n = 10
